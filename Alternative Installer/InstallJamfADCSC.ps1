@@ -1,4 +1,4 @@
-# Script to install Jamf Pro Active Directory Certificate Services Connector
+ # Script to install Jamf Pro Active Directory Certificate Services Connector
 # ("ADCSC") and configure Microsoft IIS.
 
 # To-Do:
@@ -42,12 +42,35 @@ param (
   [int]$selfSignedCertValidityYears     = 1,
   [int]$defaultPasswordLength           = 10,
 
+  # Server TLS Ident
+  # Generate self-signed with multiple SANs. Use this if you are proxying or load balancing.
+  # Also export the ident as a .pfx so you can load it on the LB/Proxy/Other Connector instances...
   [switch]$Server_MakeSelfSignedCert    = [switch]::Present,
-  [string]$Server_ExportIdentityFile    = $true,
+  [switch]$Server_ExportIdentityFile    = [switch]::Present,
   [switch]$Server_UseSuppliedIdent      = $false,
-  [string]$Server_SuppliedIdentFileName = "server-cert.pfx",
-  [string]$Server_SuppliedIdentFilePass = "LEAVEBLANK",
-  [string[]]$Server_FQDNs               = @((Get-WmiObject win32_computersystem).DNSHostName+"."+(Get-WmiObject win32_computersystem).Domain),
+  [string]$Server_SuppliedIdentFileName = "",
+  [string]$Server_SuppliedIdentFilePass = "",
+  [string[]]$Server_FQDNs               = @('adcsc.jamf.club', 'ms', 'ms.jamf.club'),
+  # Generate self-signed for just this one connector host, jsut like the default installer does.
+  # We'll export the cert since we'll need to upload it to Jamf Pro, 
+  # but we won't export the private key/.pfx -- use this if not doing a proxy/load-balancer/failover setup.
+  #  [switch]$Server_MakeSelfSignedCert    = [switch]::Present,
+  #  [switch]$Server_ExportIdentityFile    = $false,
+  #  [switch]$Server_UseSuppliedIdent      = $false,
+  #  [string]$Server_SuppliedIdentFileName = "". # "server-cert.pfx",
+  #  [string]$Server_SuppliedIdentFilePass = "", # "password123",
+  #  [string[]]$Server_FQDNs               = @((Get-WmiObject win32_computersystem).DNSHostName+"."+(Get-WmiObject win32_computersystem).Domain),
+  # Set up TLS using a .pfx file you generated when setting up another instance or that 
+  # you got from another CA, like one you got from a public CA or a wildcard your proxy
+  # team told you to use...
+  #  [switch]$Server_MakeSelfSignedCert    = $false,
+  #  [switch]$Server_ExportIdentityFile    = $false,
+  #  [switch]$Server_UseSuppliedIdent      = [switch]::Present,
+  #  [string]$Server_SuppliedIdentFileName = "server-cert.pfx",
+  #  [string]$Server_SuppliedIdentFilePass = "password123",
+  #  [string[]]$Server_FQDNs               = @("adcsc.jamf.com", "server-001.jamf.com", "server-002.jamf.com"),
+
+
 
   [switch]$Client_MakeSelfSignedCert    = [switch]::Present,
   [string]$Client_JamfProHostName       = "myorg.jamfcloud.com",
@@ -61,7 +84,10 @@ param (
   [switch]$authToAdcsAsDomainUser       = $false,
   [string]$authToAdcsAsDomainUserName   = '',
   [string]$authToAdcsAsDomainUserPass   = "",
+
   
+
+
 # If you want the Connector to authenticate to ADCS with a domain user service account, use this...
 #   [switch]$authToAdcsAsUser             = [switch]::Present,
 #   [switch]$authToAdcsAsLocalUser        = $false,
@@ -188,6 +214,7 @@ Function Write-LogError{
   Param([parameter(Position=0)]$MessageString)
   Write-Host "[error]" -NoNewline -BackgroundColor Red
   Write-Host " $MessageString I'm giving up."
+  Write-Host " $MessageString $MyInvocation.ScriptLineNumber"
   exit
 }
 Function Write-Log{
@@ -239,7 +266,6 @@ Function Test-Parameters() {
     Write-LogDebug "[OK] A ZIP file exists at $archivePath"      
   } else {
     Write-LogError "ZIP archive not found at $archivePath. "
-    exit
   }
 
   if ([string]::IsNullOrEmpty($appPoolName)){
@@ -454,11 +480,11 @@ Function Set-HTTPS() {
   Write-LogDebug "[substep] Making the public key a trusted root..."
   Import-Certificate -FilePath $Server_CertPath -CertStoreLocation Cert:\LocalMachine\Root *>$null
 
-  if($Server_MakeSelfSignedCert) {
+  if($Server_MakeSelfSignedCert.IsPresent) {
     # If we are load balancing we'll need to use this cert on other servers so
     #  if we just made it up on the fly, we'll export it so it can be copied over.
     $Server_IdentPath="$certsFolder\server-cert.pfx"
-    if ($Server_ExportIdentityFile) {
+    if ($Server_ExportIdentityFile.IsPresent) {
       Write-Log "[substep] Exporting the server identity as .pfx for use on replica Connector server(s)."
       if(Test-Path $Server_IdentPath) {
         Remove-Item $Server_IdentPath *>$null
@@ -466,20 +492,24 @@ Function Set-HTTPS() {
       $KeystoreIdentPath="cert:\LocalMachine\My\$($cert.Thumbprint)"
       Write-LogDebug "[info] Windows keystore path : $KeystoreIdentPath"
       $Server_IdentityFilePass = New-PasswordString -CharSets "ULN"
+      if ([string]::IsNullOrEmpty($Server_IdentityFilePass)) {
+        Write-LogError "Could not generate a password for the self-signed .pfx certificate export file."
+      }
       Write-Log "[notice] The server.pfx file will be saved to $KeystoreIdentPath. The keystore password is `"$Server_IdentityFilePass`". You'll need this only if you're going to be setting up additional Connector servers for load balancing or failover."
-      $Server_IdentityFilePassSecure = ConvertTo-SecureString -String $Server_IdentityFilePass -Force –AsPlainText
+      $Server_IdentityFilePassSecure = ConvertTo-SecureString -String $Server_IdentityFilePass -AsPlainText -Force
       Export-PfxCertificate -Cert $KeystoreIdentPath -FilePath $Server_IdentPath -Password $Server_IdentityFilePassSecure >$null
     }
   }
   return $cert
 }
 
-Function Set-JamfProAuthCert() {
+Function Set-JamfProAuthCert($cert) {
   Write-Log "[step] Generating or importing an identity for Jamf Pro authentication to IIS..."
   if($Client_MakeSelfSignedCert) {
     $Client_IdentSaveFilePath = "$certsFolder\client-cert.pfx"
     Write-LogDebug "[substep] Generating a self-signed certificate for $Client_JamfProHostName authentication to IIS..."
     $Server_CertCN=$Server_FQDNs[0]
+
     try {
       # Create a new cert signed by the SSL cert generated or imported above.
       # If we imported a cert it's purpose would need to include DigitalSignature
@@ -491,6 +521,10 @@ Function Set-JamfProAuthCert() {
         -KeyExportPolicy Exportable `
         -KeyUsage DigitalSignature,DataEncipherment,KeyEncipherment `
         -NotAfter (Get-Date).AddYears($selfSignedCertValidityYears)
+    } catch {
+      Write-LogError "Could not generate `"${Server_CertCN}`"-signed certificate for ${jamfProAuth_JamfProHostName}: $_"
+    }
+    try {
       #Grab the b64 of the key -- we'll need it when setting it up as a client authentication cert in IIS...
       $clientB64 = [convert]::tobase64string($clientCert.RawData)
       if(Test-Path $Client_IdentSaveFilePath) {
@@ -500,7 +534,7 @@ Function Set-JamfProAuthCert() {
       $Client_IdentKeystorePath="cert:\LocalMachine\My\$($clientCert.Thumbprint)"
       $Client_SelfSignedCertFilePass = New-PasswordString -CharSets "ULN"
       Write-Log "[notice] The client.pfx file will be saved to $Client_IdentSaveFilePath. The keystore password is `"$Client_SelfSignedCertFilePass`". You'll need this when configuring Jamf Pro to talk to this Connector."
-      $Client_SelfSignedCertFilePass_Secure = ConvertTo-SecureString -String $Client_SelfSignedCertFilePass -Force –AsPlainText
+      $Client_SelfSignedCertFilePass_Secure = ConvertTo-SecureString -String $Client_SelfSignedCertFilePass -AsPlainText -Force
       Export-PfxCertificate `
         -Cert $Client_IdentKeystorePath `
         -FilePath $Client_IdentSaveFilePath `
@@ -508,7 +542,7 @@ Function Set-JamfProAuthCert() {
       Write-LogDebug "[info] Client Authentication Certificate path in Windows keystore : $Client_IdentKeystorePath"
       Write-LogDebug "[OK] Client identity exported."
     } catch {
-      Write-LogError "Could not generate ${Server_CertCN}-signed certificate for ${jamfProAuth_JamfProHostName}: $_"
+      Write-LogError "Could not export the `"${Server_CertCN}`"-signed certificate for ${jamfProAuth_JamfProHostName}: $_"
     }
   }
   return $clientB64
@@ -570,7 +604,7 @@ Function Set-JamfProAuthUser() {
       Write-LogDebug "[substep] Creating a password for the new local user account."
       try {
         $authToAdcsAsUserPass = New-PasswordString
-        $authToAdcsAsUserPass_Secure=ConvertTo-SecureString $authToAdcsAsUserPass –asplaintext –force
+        $authToAdcsAsUserPass_Secure=ConvertTo-SecureString $authToAdcsAsUserPass -AsPlainText -Force
       } catch {
         Write-LogError "Could not configure a password for the new local user : $_"
       }
@@ -652,8 +686,8 @@ Function Set-JamfProAuthUser() {
 
       Write-LogDebug "[substep] Setting property list for oneToOneMappings."
       Write-LogDebug "[info] userName=`"$authToAdcsAsUserName`""
-      Write-LogDebug "[info] password=`"$authToAdcsAsUserPass`""
-      Write-LogDebug "[info] certificate=`"$clientB64`""
+      # Write-LogDebug "[info] password=`"$authToAdcsAsUserPass`""
+      # Write-LogDebug "[info] certificate=`"$clientB64`""
       try {
         Add-WebConfigurationProperty -pspath 'MACHINE/WEBROOT/APPHOST' `
           -location "$siteName" `
@@ -684,7 +718,6 @@ Function Set-JamfProAuthUser() {
     }
   }
 }
-
 # Resource functions:
 
 Function New-PasswordString([Int]$Size = $defaultPasswordLength, [Char[]]$CharSets = "ULNS", [Char[]]$Exclude) {
@@ -826,7 +859,7 @@ Function Invoke-Main {
   Set-ADCSC-Site
   Set-FirewallRule
   $cert = Set-HTTPS
-  $clientB64 = Set-JamfProAuthCert
+  $clientB64 = Set-JamfProAuthCert($cert)
   Set-JamfProAuthUser
   Write-LogSection "[end] Finished running $thisScript"
 
@@ -836,3 +869,4 @@ Function Invoke-Main {
 
 $ErrorActionPreference = 'Stop'
 Invoke-Main
+ 
