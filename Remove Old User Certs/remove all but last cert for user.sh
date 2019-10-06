@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# This script will remove all instances of an identity where the 
-# certificate subject matches the name of the currently logged in user. 
+# This script will remove all instances of an identity where: 
+# 1) The certificate subject matches the name of the currently  logged in user. 
+# 2) It does not have the latest expiration date.
 
 # To-do:
 # What keychain are the profile-delivered user certs in? 
