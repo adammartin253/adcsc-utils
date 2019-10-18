@@ -48,7 +48,7 @@ for cert in "${certArray[@]}"; do
 done
 echo
 
-dateHashList=$( echo "$dateHashList" | sort )
+dateHashList=$( echo "$dateHashList" | sort | uniq )
 lines=$( echo "$dateHashList" | wc -l | tr -d ' ' )
 let "lines--"
 echo "[info] There are $lines lines in the certificate date-hash list."
